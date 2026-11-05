@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 fn main() {
     let arg_data = parse_args();
-    init_logger(!arg_data.listenfds.is_empty());
+    init_logger(false);
     xwayland_satellite::main(arg_data);
 }
 

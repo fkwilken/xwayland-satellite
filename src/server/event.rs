@@ -1005,7 +1005,7 @@ impl Event for client::wl_touch::Event {
 pub(super) struct OnOutput(pub Entity);
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
-    output.map(|o| world.get::<&OutputName>(o.0).unwrap().0.clone())
+    output.and_then(|o| world.get::<&OutputName>(o.0).ok().map(|n| n.0.clone()))
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -1065,7 +1065,14 @@ pub(super) struct OutputDimensions {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    refresh: i32,
     rotated_90: bool,
+    // Whether a real wl_output.mode event has been received from upstream yet. Until this
+    // happens, we must not re-announce this output's geometry/done out of band (e.g. from
+    // global output offset recalculation), as that would send `done` before the client has
+    // ever seen a `mode`, violating wl_output's event ordering and leaving the client with a
+    // bogus 0x0 output for its initial setup.
+    mode_received: bool,
 }
 
 impl Default for OutputDimensions {
@@ -1083,8 +1090,35 @@ impl Default for OutputDimensions {
             y: 0,
             width: 0,
             height: 0,
+            refresh: 0,
             rotated_90: false,
+            mode_received: false,
         }
+    }
+}
+
+// Xwayland's RandR-emulation pointer/crossing-event dispatch (-force-xrandr-emulation) gets
+// permanently stuck for a window once it crosses from one wl_output-derived CRTC rectangle into
+// another. To avoid ever presenting Xwayland with multiple distinct CRTC rectangles, every real
+// output is advertised to Xwayland as occupying the exact same rectangle: (0, 0) sized to the
+// bounding box of all real outputs combined. Real per-output position/size (`OutputDimensions`)
+// is still tracked accurately for internal window-placement math (`WindowOutputOffset`) and
+// fullscreen-to-monitor detection; only what's reported *to Xwayland* is merged.
+fn calc_merged_output_size(world: &World) -> (i32, i32) {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for (_, dimensions) in world.query::<&OutputDimensions>().iter() {
+        min_x = min_x.min(dimensions.x);
+        min_y = min_y.min(dimensions.y);
+        max_x = max_x.max(dimensions.x + dimensions.width);
+        max_y = max_y.max(dimensions.y + dimensions.height);
+    }
+    if min_x > max_x || min_y > max_y {
+        (0, 0)
+    } else {
+        (max_x - min_x, max_y - min_y)
     }
 }
 
@@ -1174,14 +1208,22 @@ pub(super) fn update_global_output_offset(
     world: &World,
     connection: &mut impl XConnection,
 ) {
+    let (merged_width, merged_height) = calc_merged_output_size(world);
+
     let entity = world.entity(output).unwrap();
     let mut query = entity.query::<(&OutputDimensions, &WlOutput)>();
     let Some((dimensions, server)) = query.get() else {
         return;
     };
 
-    let x = dimensions.x - global_output_offset.x.value;
-    let y = dimensions.y - global_output_offset.y.value;
+    if !dimensions.mode_received {
+        // This output hasn't received its real wl_output.mode event from upstream yet, so it
+        // hasn't sent its initial `done` either. Re-announcing geometry+done here would race
+        // ahead of the real mode event and leave the client (Xwayland) with a bogus 0x0 output.
+        // It will correctly announce itself, with the current offset applied, once its own
+        // geometry/mode/done events arrive.
+        return;
+    }
 
     match &dimensions.source {
         OutputDimensionsSource::Wl {
@@ -1193,8 +1235,8 @@ pub(super) fn update_global_output_offset(
             transform,
         } => {
             server.geometry(
-                x,
-                y,
+                0,
+                0,
                 *physical_width,
                 *physical_height,
                 convert_wenum(*subpixel),
@@ -1202,12 +1244,17 @@ pub(super) fn update_global_output_offset(
                 model.clone(),
                 convert_wenum(*transform),
             );
+            server.mode(
+                wayland_server::protocol::wl_output::Mode::Current,
+                merged_width,
+                merged_height,
+                dimensions.refresh,
+            );
         }
         OutputDimensionsSource::Xdg => {
-            entity
-                .get::<&XdgOutputServer>()
-                .unwrap()
-                .logical_position(x, y);
+            let xdg = entity.get::<&XdgOutputServer>().unwrap();
+            xdg.logical_position(0, 0);
+            xdg.logical_size(merged_width, merged_height);
         }
     }
 
@@ -1276,7 +1323,7 @@ impl OutputEvent {
                     y,
                     state,
                 );
-                let global_output_offset = state.global_output_offset;
+                let (merged_width, merged_height) = calc_merged_output_size(&state.world);
 
                 let Ok((output, dimensions, xdg)) = state.world.query_one_mut::<(
                     &WlOutput,
@@ -1287,8 +1334,8 @@ impl OutputEvent {
                 };
 
                 output.geometry(
-                    x - global_output_offset.x.value,
-                    y - global_output_offset.y.value,
+                    0,
+                    0,
                     physical_width,
                     physical_height,
                     convert_wenum(subpixel),
@@ -1306,11 +1353,8 @@ impl OutputEvent {
                     )
                 });
                 if let Some(xdg) = xdg {
-                    if dimensions.rotated_90 {
-                        xdg.logical_size(dimensions.height, dimensions.width);
-                    } else {
-                        xdg.logical_size(dimensions.width, dimensions.height);
-                    }
+                    xdg.logical_position(0, 0);
+                    xdg.logical_size(merged_width, merged_height);
                 }
             }
             Event::Mode {
@@ -1319,22 +1363,29 @@ impl OutputEvent {
                 height,
                 refresh,
             } => {
-                let Ok((output, dimensions)) = state
-                    .world
-                    .query_one_mut::<(&WlOutput, &mut OutputDimensions)>(target)
-                else {
-                    return;
-                };
-
-                if flags
+                let is_current = flags
                     .into_result()
-                    .is_ok_and(|f| f.contains(client::wl_output::Mode::Current))
+                    .is_ok_and(|f| f.contains(client::wl_output::Mode::Current));
                 {
-                    dimensions.width = width;
-                    dimensions.height = height;
-                    debug!("{} dimensions: {width}x{height}", output.id());
+                    let Ok(mut dimensions) =
+                        state.world.get::<&mut OutputDimensions>(target)
+                    else {
+                        return;
+                    };
+                    if is_current {
+                        dimensions.width = width;
+                        dimensions.height = height;
+                        dimensions.refresh = refresh;
+                    }
+                    dimensions.mode_received = true;
                 }
-                output.mode(convert_wenum(flags), width, height, refresh);
+                let (merged_width, merged_height) = calc_merged_output_size(&state.world);
+                let output = state.world.get::<&WlOutput>(target).unwrap();
+                debug!(
+                    "{} dimensions: {width}x{height} (merged: {merged_width}x{merged_height})",
+                    output.id()
+                );
+                output.mode(convert_wenum(flags), merged_width, merged_height, refresh);
             }
             Event::Scale { factor } => {
                 debug!(
@@ -1384,24 +1435,18 @@ impl OutputEvent {
                         .world
                         .get::<&XdgOutputServer>(target)
                         .unwrap()
-                        .logical_position(
-                            x - state.global_output_offset.x.value,
-                            y - state.global_output_offset.y.value,
-                        );
+                        .logical_position(0, 0);
                 }
             }
             Event::LogicalSize { .. } => {
-                let Ok((xdg, dimensions)) = state
+                let (merged_width, merged_height) = calc_merged_output_size(&state.world);
+                let Ok((xdg, _)) = state
                     .world
                     .query_one_mut::<(&XdgOutputServer, &OutputDimensions)>(target)
                 else {
                     return;
                 };
-                if dimensions.rotated_90 {
-                    xdg.logical_size(dimensions.height, dimensions.width);
-                } else {
-                    xdg.logical_size(dimensions.width, dimensions.height);
-                }
+                xdg.logical_size(merged_width, merged_height);
             }
             _ => simple_event_shunt! {
                 state.world.get::<&XdgOutputServer>(target).unwrap(),

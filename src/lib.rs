@@ -98,6 +98,10 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         .args([
             "-rootless",
             "-force-xrandr-emulation",
+            "-fp",
+            "/usr/share/X11/fonts/misc",
+            "-xkbdir",
+            "/usr/share/X11/xkb",
             "-wm",
             &xsock_xwl.as_raw_fd().to_string(),
             "-displayfd",
@@ -105,6 +109,7 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         ])
         .args(data.flags())
         .env("WAYLAND_DISPLAY", socket.socket_name().unwrap())
+        .env("XKB_BINDIR", "/usr/bin")
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();

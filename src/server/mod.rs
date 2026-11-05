@@ -509,12 +509,13 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
         let qh = queue.handle();
 
         let xdg_wm_base = global_list
-            .bind::<XdgWmBase, _, _>(&qh, 2..=6, ())
+            .bind::<XdgWmBase, _, _>(&qh, 1..=6, ())
             .expect("Could not bind xdg_wm_base");
 
         if xdg_wm_base.version() < 3 {
             warn!(
-                "xdg_wm_base version 2 detected. Popup repositioning will not work, and some popups may not work correctly."
+                "xdg_wm_base version {} detected. Popup repositioning will not work, and some popups may not work correctly.",
+                xdg_wm_base.version()
             );
         }
 
